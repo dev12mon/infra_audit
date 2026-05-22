@@ -1,0 +1,31 @@
+# Dockerfile
+# Stage 1: Base image using a slim footprint to reduce attack surface
+FROM python:3.11-slim
+
+# Set environment variables for optimized Python execution
+# PYTHONDONTWRITEBYTECODE: Prevents Python from writing .pyc files to disk
+# PYTHONUNBUFFERED: Ensures stdout/stderr are flushed immediately (critical for log aggregation)
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Set the working directory
+WORKDIR /app
+
+# Install dependencies first to leverage Docker layer caching
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the application code
+COPY . .
+
+# Security Best Practice: Create a non-root user to run the application
+# Running as root inside a container is a major security anti-pattern in K8s
+RUN addgroup --system appgroup && \
+    adduser --system --group appuser && \
+    chown -R appuser:appgroup /app
+
+# Switch to the non-root user
+USER appuser
+
+# Set the default execution command
+CMD ["python", "main.py"]

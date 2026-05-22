@@ -1,0 +1,5 @@
+# requirements.txt
+# Pinned versions ensure reproducible builds across all environments
+
+boto3==1.34.100
+requests==2.31.0

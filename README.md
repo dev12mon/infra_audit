@@ -493,3 +493,263 @@ Once the code is safely in a private repository, the logical next steps for this
 * **Dependency Management:** Generate a `requirements.txt` or `Pipfile` locking in the versions of `boto3` and `requests`.
 * **Containerization:** Draft a `Dockerfile` using a slim Python base image to ensure the environment is reproducible.
 * **Testing:** Add a `tests/` directory and write a few `pytest` functions mocking the AWS API responses to validate your OOP models and retry decorators without hitting real endpoints.
+
+
+
+
+
+This is exactly the right sequence. In Platform Engineering, you don't push to production without automated tests, a highly optimized artifact, and a CI pipeline to enforce the standards.
+
+Here is the complete engineering setup for the next phase: Unit Testing, a Multi-Stage Dockerfile, and a GitHub Actions pipeline.
+
+---
+
+### 1. Unit Testing: Mocking APIs & Retries
+
+Testing infrastructure code requires mocking external dependencies (like AWS APIs or HTTP endpoints) so tests run fast, offline, and deterministically. We will use `pytest` and `unittest.mock`.
+
+Create a `tests/` directory and add `test_health_checker.py`:
+
+```python
+# tests/test_health_checker.py
+import pytest
+from unittest.mock import patch, MagicMock
+from services.health_checker import APIHealthChecker
+import requests
+from core.exceptions import APIConnectionError
+
+@pytest.fixture
+def health_checker():
+    return APIHealthChecker()
+
+@patch('requests.Session.get')
+def test_check_endpoint_success(mock_get, health_checker):
+    """Test that a 200 OK response is parsed correctly without retries."""
+    # Setup the mock response
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_get.return_value = mock_response
+
+    result = health_checker._check_endpoint("https://fake-api.com/health")
+    
+    assert result['status'] == "UP"
+    assert result['code'] == 200
+    assert mock_get.call_count == 1
+
+@patch('requests.Session.get')
+def test_check_endpoint_retry_logic(mock_get, health_checker):
+    """Test that the retry decorator attempts exactly 3 times on connection errors."""
+    # Force the mock to raise a ConnectionError every time it's called
+    mock_get.side_effect = requests.ConnectionError("Network down")
+
+    with pytest.raises(APIConnectionError):
+        health_checker._check_endpoint("https://fake-api.com/health")
+    
+    # Verify the backoff decorator actually retried 3 times before failing
+    assert mock_get.call_count == 3
+
+```
+
+**To run the tests locally:**
+Add `pytest` to your requirements or environment, then run:
+
+```bash
+python -m pytest tests/ -v
+
+```
+
+---
+
+### 2. The Multi-Stage Production Dockerfile
+
+A standard Dockerfile leaves build tools and caching artifacts in the final image, bloating the size and increasing the security attack surface.
+
+A **Multi-Stage Build** fixes this by using a "builder" stage to compile dependencies into Python wheels, and a fresh, minimal "runtime" stage that only copies the compiled binaries and application code.
+
+Replace your existing `Dockerfile` with this optimized version:
+
+```dockerfile
+# ==========================================
+# STAGE 1: Builder
+# Compiles dependencies and generates wheels
+# ==========================================
+FROM python:3.11-slim as builder
+
+# Install build dependencies (gcc, etc.) needed for compiling Python C-extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /usr/src/app
+
+# Copy only requirements to cache this layer
+COPY requirements.txt .
+
+# Build wheels for all dependencies to avoid installing build tools in final image
+RUN pip wheel --no-cache-dir --no-deps --wheel-dir /usr/src/app/wheels -r requirements.txt
+
+# ==========================================
+# STAGE 2: Runtime
+# Minimal final image optimized for space and security
+# ==========================================
+FROM python:3.11-slim
+
+# Set strict Python runtime configurations
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/home/appuser/.local/bin:$PATH"
+
+# Create a non-root system user and group for security
+RUN addgroup --system appgroup && \
+    adduser --system --group appuser
+
+WORKDIR /app
+
+# Copy compiled wheels from the builder stage
+COPY --from=builder /usr/src/app/wheels /wheels
+COPY --from=builder /usr/src/app/requirements.txt .
+
+# Install the pre-compiled wheels (no build tools needed here)
+RUN pip install --no-cache /wheels/*
+
+# Copy application source code and set ownership to the non-root user
+COPY --chown=appuser:appgroup . .
+
+# Switch to the restricted user
+USER appuser
+
+# Execute the application
+CMD ["python", "main.py"]
+
+```
+
+---
+
+### 3. GitHub Actions CI Pipeline (GA CI)
+
+Now we wire it up so that every push to the repository runs the unit tests, checks for syntax errors, and verifies the multi-stage Docker build succeeds.
+
+Create the file `.github/workflows/ci.yml`:
+
+```yaml
+name: InfraAudit CI Pipeline
+
+# Trigger on pushes and PRs to the main branch
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip' # Leverages GitHub's built-in caching for pip
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest flake8
+
+      - name: Lint with Flake8
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run Pytest
+        run: |
+          pytest tests/ -v
+
+  docker-build:
+    name: Verify Multi-Stage Docker Build
+    needs: test # Ensure tests pass before spending compute on Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Cache Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false # Set to true later when deploying to a registry (GCR/ECR)
+          tags: infra-audit:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+```
+
+### Why this setup stands out:
+
+1. **The Pytest fixture** ensures the retry decorator is mathematically validated to hit `max_attempts=3`.
+2. **The Dockerfile** drops the `gcc` compiler from the final image, significantly reducing the image size and eliminating common CVE vulnerabilities associated with OS-level build tools.
+3. **The GitHub Action** utilizes `cache-from: type=gha`, meaning subsequent Docker builds in CI will use GitHub's cache API, dropping build times from minutes to seconds.
+
+Once this CI pipeline is green and the image is compiling cleanly, we are ready for orchestration and deployment. Would you prefer to tackle the Kubernetes manifests (Deployments/CronJobs) next, or set up Terraform to provision the underlying GCP/AWS infrastructure?
+
+
+
+
+
+
+
+
+
+
+
+Ah, the classic macOS global Python trap. You are currently hitting the system-level Python installation (specifically, a framework install of 3.14), which doesn't have `pytest` installed.
+
+As a best practice in Platform Engineering, we strictly avoid installing packages into the global OS environment to prevent dependency conflicts and "it works on my machine" syndromes. We need to sandbox this project using a virtual environment (`venv`).
+
+Here is the exact sequence to isolate your workspace, install the dependencies, and run the tests.
+
+Run these commands in your VS Code terminal:
+
+### 1. Create and Activate a Virtual Environment
+
+```bash
+# Create a hidden virtual environment directory named .venv
+python3 -m venv .venv
+
+# Activate the virtual environment
+source .venv/bin/activate
+
+```
+
+*(Tip: Once activated, your terminal prompt will usually update to show `(.venv)` on the left. From this point on, typing `python` or `pip` will automatically use the isolated environment, not the macOS global one.)*
+
+### 2. Install Dependencies
+
+Now that you are sandboxed, install your pinned project requirements along with the testing framework:
+
+```bash
+pip install -r requirements.txt pytest
+
+```
+
+### 3. Execute the Tests
+
+With `pytest` installed inside the virtual environment, your original command will now execute perfectly:
+
+```bash
+python -m pytest tests/ -v
+
+```
+
+---
+
+Once those unit tests light up green in your terminal, the local foundation of `InfraAudit` is rock solid. Shall we move on to drafting the Kubernetes manifests (Deployments/CronJobs) for orchestration, or would you prefer to set up the Terraform state to provision the underlying cloud infrastructure first?
